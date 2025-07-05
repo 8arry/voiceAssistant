@@ -13,10 +13,15 @@ import { fetchEventSource } from '@microsoft/fetch-event-source';
 import { useAuth } from '@/context/AuthProvider';
 
 interface VoiceEvent {
-  type: 'text' | 'audio';
+  type: 'text' | 'audio' | 'session_created' | 'heartbeat' | 'error';
   data?: string;
   mime_type?: string;
   text?: string;
+  session_id?: string;
+  timestamp?: string;
+  error?: string;
+  message?: string;
+  partial?: boolean;
 }
 
 interface VoiceAssistantOverlayProps {
@@ -32,10 +37,17 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
   const [isAudioMode, setIsAudioMode] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [lastResponse, setLastResponse] = useState<string>('');
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
   const isSendingRef = useRef(false);
   
   const volume = useMicrophoneVolume(isOpen && !paused && isAudioMode);
   const userId = user?.id;
+  
+  // Debug sessionId changes
+  useEffect(() => {
+    console.log('🔍 SessionId state changed to:', sessionId);
+  }, [sessionId]);
   
   useEffect(() => {
     if (isSpeaking && volume > 0.1) {      
@@ -63,7 +75,6 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
   const audioBufferRef = useRef<Uint8Array[]>([]);
   const speakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-
   // Connect to SSE for real-time communication
   const connectSSE = useCallback((audioMode: boolean = true) => {
     // Abort existing connection
@@ -71,8 +82,8 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
       eventSourceRef.current.abort();
     }
 
-    const sseUrl = `${process.env.NEXT_PUBLIC_API_URL}/api/voice/events/${userId}?is_audio=${audioMode}`;
-    console.log(`🔗 Connecting SSE with audio mode: ${audioMode}`);
+    const sseUrl = `${process.env.NEXT_PUBLIC_API_URL}/api/voice-redis/events/${userId}?is_audio=${audioMode}`;
+    console.log(`🔗 Connecting Redis SSE with audio mode: ${audioMode}`);
     
     const startConnection = async () => {
       try {
@@ -88,7 +99,7 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
           signal: abortController.signal,
           async onopen(response) {
             if (response.ok) {
-              console.log('🔗 SSE connection established');
+              console.log('🔗 Redis SSE connection established');
               setIsConnected(true);
               // Set audio mode when connection is established
               setIsAudioMode(true);
@@ -98,10 +109,11 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
           },
           onmessage(event) {
             try {
+              console.log('🔍 Raw SSE message:', event.data);
               const messageFromServer: VoiceEvent = JSON.parse(event.data);
               handleServerMessage(messageFromServer);
             } catch (error) {
-              console.error('Failed to parse server message:', error);
+              console.error('Failed to parse server message:', error, 'Raw data:', event.data);
             }
           },
           onerror(error) {
@@ -122,10 +134,32 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
 
   // Handle messages from server
   const handleServerMessage = (message: VoiceEvent) => {
-    console.log('📨 Received server message:', message);
+    console.log('📨 Received Redis server message:', message);
     
-    if (message.type === 'text' && message.text) {
-      setLastResponse(message.text);
+    // Handle session_created event
+    if (message.type === 'session_created' && message.session_id) {
+      console.log('🔍 Setting sessionId from:', message.session_id);
+      setSessionId(message.session_id);
+      sessionIdRef.current = message.session_id; // Also store in ref for immediate access
+      console.log('✅ Voice session created:', message.session_id);
+      return;
+    }
+    
+    // Handle heartbeat event
+    if (message.type === 'heartbeat') {
+      console.log('💓 Heartbeat received');
+      return;
+    }
+    
+    // Handle error event
+    if (message.type === 'error') {
+      console.error('❌ Server error:', message.error || message.message);
+      return;
+    }
+    
+    if (message.type === 'text' && (message.data || message.text)) {
+      const textContent = message.data || message.text || '';
+      setLastResponse(textContent);
       // When we receive text, system is about to speak
       setIsSpeaking(true);
       
@@ -157,7 +191,7 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
   };
 
   // Initialize audio system
-  const initializeAudio = async () => {
+  const initializeAudio = useCallback(async () => {
     try {
       // Start audio output
       const [playerNode, playerCtx] = await startAudioPlayerWorklet();
@@ -190,7 +224,7 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
       console.error('❌ Failed to initialize audio system:', error);
       return false;
     }
-  };
+  }, [paused, isOpen, setIsSpeaking]);
 
   // Handle audio data from recorder
   function audioRecorderHandler(pcmData: ArrayBuffer) {
@@ -207,6 +241,13 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
   // Send buffered audio to server
   const sendBufferedAudio = useCallback(async () => {
     if (paused || !isOpen) {
+      isSendingRef.current = false;
+      return;
+    }
+    
+    const currentSessionId = sessionIdRef.current || sessionId;
+    if (!currentSessionId) {
+      console.warn('⚠️ No sessionId available, cannot send audio. State sessionId:', sessionId, 'Ref sessionId:', sessionIdRef.current);
       isSendingRef.current = false;
       return;
     }
@@ -232,16 +273,50 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
 
     const base64Data = btoa(String.fromCharCode(...combinedArray));
     
+    console.log(`🎤 Sending audio data to session: ${currentSessionId}, size: ${base64Data.length} chars`);
+    
     try {
       const token = await getAccessToken();
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/voice/send/${userId}`, {
+      // Use new Redis API endpoint with session_id
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/voice-redis/send/${currentSessionId}`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ type: 'audio', data: base64Data, mime_type: 'audio/pcm' }),
+        body: JSON.stringify({ mime_type: 'audio/pcm', data: base64Data }),
       });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      // Handle streaming response
+      const reader = response.body?.getReader();
+      if (reader) {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            const chunk = new TextDecoder().decode(value);
+            const lines = chunk.split('\n');
+            
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.substring(6));
+                  handleServerMessage(data);
+                } catch {
+                  console.warn('Failed to parse chunk:', line);
+                }
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
     } catch (error) {
       console.error('Failed to send audio data:', error);
       // If there's an error, put the unsent audio back at the beginning of the buffer
@@ -250,7 +325,7 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
       // Whether successful or not, check and try to send again after 200ms
       setTimeout(sendBufferedAudio, 200);
     }
-  }, [isOpen, paused, userId]); 
+  }, [isOpen, paused, sessionId]);
 
   // Start audio mode when overlay opens
   useEffect(() => {
@@ -266,7 +341,7 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
           // Connect SSE with audio mode
           connectSSE(true);
           
-          console.log('🎤 Voice mode starting...');
+          console.log('🎤 Redis voice mode starting...');
         } catch (error) {
           console.error('❌ Failed to start voice mode:', error);
         }
@@ -294,7 +369,7 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
   };
 
   // Handle close
-  const handleClose = () => {
+  const handleClose = useCallback(() => {
     console.log('🔚 handleClose called');
     
     // Clear speaking timeout
@@ -325,12 +400,14 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
     setPaused(false);
     setIsSpeaking(false);
     setLastResponse('');
+    setSessionId(null);
+    sessionIdRef.current = null;
     audioBufferRef.current = [];
     isSendingRef.current = false;
 
-    console.log('🔚 Voice assistant closed');
+    console.log('🔚 Redis voice assistant closed');
     onClose();
-  };
+  }, [onClose]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -356,7 +433,8 @@ export default function VoiceAssistantOverlay({ isOpen, onClose, isDarkMode }: V
           {!isConnected && '🔄 Connecting...'}
           {isConnected && paused && '⏸️ Paused'}
           {isConnected && !paused && isSpeaking && '🔊 Speaking...'}
-          {isConnected && !paused && !isSpeaking && '🎤 Listening...'}
+          {isConnected && !paused && !isSpeaking && sessionId && '🎤 Listening...'}
+          {isConnected && !paused && !isSpeaking && !sessionId && '⏳ Waiting for session...'}
         </div>
         <button
           className="size-12 flex justify-center items-center rounded-full bg-black/20 hover:bg-black/40 text-white transition cursor-pointer relative z-10"
